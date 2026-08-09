@@ -1,6 +1,7 @@
 """
-Bake per-view depth/opacity maps from a trained NGP+OccGrid checkpoint.
+Bake per-view depth/opacity/frequency maps from a trained NGP+OccGrid checkpoint.
 
+Frequency F(u,v) follows FAGS Laplacian-band energy (see examples/oracle_frequency.py).
 Supports NeRF-Synthetic and Mip-NeRF 360 (`data/360_v2`).
 Does not modify train_ngp_nerf_occ.py.
 
@@ -17,6 +18,7 @@ import torch
 import tqdm
 from radiance_fields.ngp import NGPRadianceField
 
+from examples.oracle_frequency import laplacian_frequency_map
 from examples.utils import (
     MIPNERF360_UNBOUNDED_SCENES,
     NERF_SYNTHETIC_SCENES,
@@ -89,6 +91,12 @@ def main():
     )
     parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--test_chunk_size", type=int, default=8192)
+    parser.add_argument(
+        "--freq_num_levels",
+        type=int,
+        default=4,
+        help="Laplacian pyramid levels for frequency map (FAGS-style)",
+    )
     args = parser.parse_args()
 
     device = "cuda:0"
@@ -123,10 +131,11 @@ def main():
 
     depths = []
     opacities = []
+    frequencies = []
     with torch.no_grad():
         for i in tqdm.tqdm(range(len(dataset)), desc=f"Baking {args.split}"):
             data = dataset[i]
-            _, acc, depth, _ = render_image_with_occgrid(
+            rgb, acc, depth, _ = render_image_with_occgrid(
                 radiance_field,
                 estimator,
                 data["rays"],
@@ -139,9 +148,15 @@ def main():
             )
             depths.append(depth.squeeze(-1).cpu())
             opacities.append(acc.squeeze(-1).cpu())
+            frequencies.append(
+                laplacian_frequency_map(
+                    rgb.cpu(), num_levels=args.freq_num_levels
+                )
+            )
 
     depths = torch.stack(depths, dim=0)
     opacities = torch.stack(opacities, dim=0)
+    frequencies = torch.stack(frequencies, dim=0)
 
     out_path = (
         pathlib.Path(args.output_path)
@@ -161,6 +176,8 @@ def main():
             "data_root": data_root,
             "depths": depths,
             "opacities": opacities,
+            "frequencies": frequencies,
+            "freq_num_levels": args.freq_num_levels,
             "height": depths.shape[1],
             "width": depths.shape[2],
             "is_360": args.scene in MIPNERF360_UNBOUNDED_SCENES,
@@ -174,7 +191,8 @@ def main():
     print(
         f"depth stats: min={depths.min():.4f} max={depths.max():.4f} "
         f"mean={depths.mean():.4f} | opacity mean={opacities.mean():.4f} "
-        f"frac>=0.01={(opacities >= 0.01).float().mean():.4f}"
+        f"frac>=0.01={(opacities >= 0.01).float().mean():.4f} | "
+        f"freq mean={frequencies.mean():.4f} max={frequencies.max():.4f}"
     )
 
 

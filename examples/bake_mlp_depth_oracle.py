@@ -1,7 +1,8 @@
 """
-Bake per-view depth and opacity maps from a trained MLP+OccGrid checkpoint.
+Bake per-view depth, opacity, and frequency maps from a trained MLP+OccGrid checkpoint.
 
 These maps are used as a frozen 2D sampling oracle by train_mlp_nerf_depth_oracle.py.
+Frequency F(u,v) follows FAGS Laplacian-band energy (see examples/oracle_frequency.py).
 Does not modify train_mlp_nerf.py.
 """
 
@@ -13,6 +14,7 @@ import tqdm
 from datasets.nerf_synthetic import SubjectLoader
 from radiance_fields.mlp import VanillaNeRFRadianceField
 
+from examples.oracle_frequency import laplacian_frequency_map
 from examples.utils import (
     NERF_SYNTHETIC_SCENES,
     render_image_with_occgrid,
@@ -53,6 +55,12 @@ def main():
         help="Where to save oracle .pt (default: experiments/oracles/<scene>/<split>_depth_opacity.pt)",
     )
     parser.add_argument("--test_chunk_size", type=int, default=4096)
+    parser.add_argument(
+        "--freq_num_levels",
+        type=int,
+        default=4,
+        help="Laplacian pyramid levels for frequency map (FAGS-style)",
+    )
     args = parser.parse_args()
 
     device = "cuda:0"
@@ -85,6 +93,7 @@ def main():
 
     depths = []
     opacities = []
+    frequencies = []
     with torch.no_grad():
         for i in tqdm.tqdm(range(len(dataset)), desc=f"Baking {args.split}"):
             data = dataset[i]
@@ -100,9 +109,15 @@ def main():
             # depth/acc: [H, W, 1] -> [H, W]
             depths.append(depth.squeeze(-1).cpu())
             opacities.append(acc.squeeze(-1).cpu())
+            frequencies.append(
+                laplacian_frequency_map(
+                    rgb.cpu(), num_levels=args.freq_num_levels
+                )
+            )
 
     depths = torch.stack(depths, dim=0)
     opacities = torch.stack(opacities, dim=0)
+    frequencies = torch.stack(frequencies, dim=0)
 
     out_path = (
         pathlib.Path(args.output_path)
@@ -120,6 +135,8 @@ def main():
         "model_path": args.model_path,
         "depths": depths,  # [N, H, W]
         "opacities": opacities,  # [N, H, W]
+        "frequencies": frequencies,  # [N, H, W] Laplacian energy in [0,1]
+        "freq_num_levels": args.freq_num_levels,
         "height": depths.shape[1],
         "width": depths.shape[2],
     }
@@ -132,7 +149,8 @@ def main():
         f"depth stats: min={depths.min():.4f} max={depths.max():.4f} "
         f"mean={depths.mean():.4f} | "
         f"opacity mean={opacities.mean():.4f} "
-        f"frac>=0.01={(opacities >= 0.01).float().mean():.4f}"
+        f"frac>=0.01={(opacities >= 0.01).float().mean():.4f} | "
+        f"freq mean={frequencies.mean():.4f} max={frequencies.max():.4f}"
     )
 
 

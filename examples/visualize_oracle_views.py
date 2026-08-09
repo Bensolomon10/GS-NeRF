@@ -1,6 +1,6 @@
 """
-Visualize oracle depth/opacity maps and optional RGB renders from evenly
-spaced viewpoints (NeRF-Synthetic or Mip-NeRF 360).
+Visualize oracle depth/opacity/frequency maps and optional RGB renders from
+evenly spaced viewpoints (NeRF-Synthetic or Mip-NeRF 360).
 
 Outputs under experiments/ (default: experiments/oracles/<scene>/vis_<split>/).
 """
@@ -132,6 +132,12 @@ def main():
         help="Matplotlib colormap for opacity",
     )
     parser.add_argument(
+        "--freq_cmap",
+        type=str,
+        default="viridis",
+        help="Matplotlib colormap for frequency",
+    )
+    parser.add_argument(
         "--out_dir",
         type=str,
         default=None,
@@ -141,7 +147,7 @@ def main():
     parser.add_argument(
         "--make_gif",
         action="store_true",
-        help="Also write animated GIFs (depth / opacity / rgb)",
+        help="Also write animated GIFs (depth / opacity / frequency / rgb)",
     )
     parser.add_argument(
         "--render_with_oracle",
@@ -184,6 +190,7 @@ def main():
     )
     depth_dir = out_dir / "depth"
     opacity_dir = out_dir / "opacity"
+    freq_dir = out_dir / "frequency"
     rgb_dir = out_dir / "rgb"
     for d in (depth_dir, opacity_dir):
         d.mkdir(parents=True, exist_ok=True)
@@ -197,17 +204,37 @@ def main():
         f"Oracle {oracle_path}: N={n_views}, writing {len(indices)} views -> {out_dir}"
     )
 
-    # Shared depth scale across selected views (foreground only).
+    has_frequencies = "frequencies" in oracle
+    if has_frequencies:
+        frequencies = oracle["frequencies"].numpy()
+        freq_dir.mkdir(parents=True, exist_ok=True)
+        print("Using baked frequency maps from oracle .pt")
+    else:
+        frequencies = None
+        print(
+            "Oracle .pt has no 'frequencies' — skipping frequency map visualization. "
+            "Re-bake with bake_*_depth_oracle.py to include them."
+        )
+
+    # Shared depth (/ frequency) scale across selected views (foreground only).
     fg_all = opacities[indices] >= args.opacity_threshold
     if fg_all.any():
         d_fg = depths[indices][fg_all]
         d_vmin = float(np.percentile(d_fg, 2))
         d_vmax = float(np.percentile(d_fg, 98))
+        if has_frequencies:
+            f_fg = frequencies[indices][fg_all]
+            f_vmin = float(np.percentile(f_fg, 2))
+            f_vmax = float(np.percentile(f_fg, 98))
+        else:
+            f_vmin, f_vmax = 0.0, 1.0
     else:
         d_vmin, d_vmax = 0.0, 1.0
+        f_vmin, f_vmax = 0.0, 1.0
 
     depth_frames = []
     opacity_frames = []
+    freq_frames = []
     for k, view_i in enumerate(tqdm.tqdm(indices, desc="Oracle maps")):
         depth = depths[view_i]
         opacity = opacities[view_i]
@@ -237,9 +264,26 @@ def main():
         depth_frames.append(depth_rgb)
         opacity_frames.append(opacity_rgb)
 
+        if has_frequencies:
+            freq_rgb = colorize_scalar(
+                frequencies[view_i],
+                fg,
+                args.freq_cmap,
+                vmin=f_vmin,
+                vmax=f_vmax,
+                bg_rgb=(1.0, 1.0, 1.0),
+            )
+            freq_name = f"frequency_{k:02d}_view{view_i:03d}.png"
+            imageio.imwrite(freq_dir / freq_name, freq_rgb)
+            freq_frames.append(freq_rgb)
+
     if args.make_gif:
         imageio.mimsave(out_dir / "depth_360.gif", depth_frames, duration=0.25)
         imageio.mimsave(out_dir / "opacity_360.gif", opacity_frames, duration=0.25)
+        if has_frequencies:
+            imageio.mimsave(
+                out_dir / "frequency_360.gif", freq_frames, duration=0.25
+            )
 
     # Optional RGB multi-view from a trained checkpoint (MLP or NGP Occ).
     if args.model_path is not None:
@@ -388,10 +432,12 @@ def main():
             imageio.mimsave(out_dir / "rgb_360.gif", rgb_frames, duration=0.25)
 
     print(f"Done. Wrote visualizations to {out_dir}")
-    print(f"  depth/:   {len(indices)} images")
-    print(f"  opacity/: {len(indices)} images")
+    print(f"  depth/:     {len(indices)} images")
+    print(f"  opacity/:   {len(indices)} images")
+    if has_frequencies:
+        print(f"  frequency/: {len(indices)} images")
     if args.model_path is not None:
-        print(f"  rgb/:     {len(indices)} images")
+        print(f"  rgb/:       {len(indices)} images")
 
 
 if __name__ == "__main__":

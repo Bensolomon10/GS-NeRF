@@ -103,6 +103,16 @@ def render_image_with_occgrid(
     # optional per-ray bounds (e.g. depth-oracle band)
     t_min: Optional[torch.Tensor] = None,
     t_max: Optional[torch.Tensor] = None,
+    # --- Frequency-aware marching (oracle / LookCloser-style) ---
+    # Optional per-ray step size δ(u,v). High image-frequency rays should use a
+    # *smaller* δ (denser samples along the ray). Typical source:
+    #   examples.oracle_frequency.render_step_size_from_frequency(F)
+    # Shape matches rays: [N] or [H, W]. If None, use scalar render_step_size.
+    render_step_sizes: Optional[torch.Tensor] = None,
+    # OccGridEstimator.sampling() only accepts one scalar step per call, so when
+    # render_step_sizes is set we quantize rays into this many δ-bins and call
+    # the scalar path once per bin (see block below).
+    num_step_bins: int = 4,
     # If True, skip density early-stop in estimator.sampling (useful with depth oracle).
     skip_sigma_fn: bool = False,
     # test options
@@ -123,8 +133,83 @@ def render_image_with_occgrid(
             t_min = t_min.reshape(num_rays)
         if t_max is not None:
             t_max = t_max.reshape(num_rays)
+        if render_step_sizes is not None:
+            render_step_sizes = render_step_sizes.reshape(num_rays)
     else:
         num_rays, _ = rays_shape
+
+    # Frequency-adaptive steps: nerfacc traverse/march takes a single float
+    # `step_size`, not a per-ray tensor. Approximate true per-ray δ by:
+    #   1) binning rays in log(δ) into `num_step_bins` groups
+    #   2) marching each group with that bin's *min* δ (conservative for high-F)
+    #   3) scattering RGB/opacity/depth back into the full ray order
+    # If the step range is tiny (or bins==1), fall through to one scalar call.
+    if render_step_sizes is not None and num_rays > 0:
+        steps = render_step_sizes.reshape(num_rays).float()
+        step_min = float(steps.min().item())
+        step_max = float(steps.max().item())
+        if step_max <= step_min * 1.01 or num_step_bins <= 1:
+            # Nearly uniform δ — fall through to the scalar march below.
+            # Do NOT recurse with already-flattened rays: that would return
+            # [N, 3] instead of [H, W, 3] when the caller passed an image.
+            render_step_size = step_min
+            render_step_sizes = None
+        else:
+            # Log-spaced bins so fine and coarse δ are both represented.
+            # Min step in-bin keeps high-frequency rays from undersampling.
+            log_min = np.log(max(step_min, 1e-12))
+            log_max = np.log(max(step_max, 1e-12))
+            edges = torch.linspace(
+                log_min, log_max, num_step_bins + 1, device=steps.device
+            )
+            bin_ids = torch.bucketize(steps.log(), edges[1:-1])
+            device = steps.device
+            colors = torch.zeros(num_rays, 3, device=device)
+            opacities = torch.zeros(num_rays, 1, device=device)
+            depths = torch.zeros(num_rays, 1, device=device)
+            n_samples_total = 0
+            for b in range(num_step_bins):
+                idx = (bin_ids == b).nonzero(as_tuple=False).squeeze(-1)
+                if idx.numel() == 0:
+                    continue
+                # Conservative: densest (smallest) δ among rays in this frequency bin.
+                step_b = float(steps[idx].min().item())
+                sub_rays = Rays(
+                    origins=rays.origins[idx],
+                    viewdirs=rays.viewdirs[idx],
+                )
+                sub_t_min = None if t_min is None else t_min[idx]
+                sub_t_max = None if t_max is None else t_max[idx]
+                sub_ts = None if timestamps is None else timestamps[idx]
+                # Recursive call with scalar step only (render_step_sizes=None).
+                c, o, d, n = render_image_with_occgrid(
+                    radiance_field,
+                    estimator,
+                    sub_rays,
+                    near_plane=near_plane,
+                    far_plane=far_plane,
+                    render_step_size=step_b,
+                    render_bkgd=render_bkgd,
+                    cone_angle=cone_angle,
+                    alpha_thre=alpha_thre,
+                    t_min=sub_t_min,
+                    t_max=sub_t_max,
+                    render_step_sizes=None,
+                    skip_sigma_fn=skip_sigma_fn,
+                    test_chunk_size=test_chunk_size,
+                    timestamps=sub_ts,
+                )
+                colors[idx] = c
+                opacities[idx] = o
+                depths[idx] = d
+                n_samples_total += n
+            # Reshape with the *original* rays_shape (still [H,W,3] if image).
+            return (
+                colors.view((*rays_shape[:-1], -1)),
+                opacities.view((*rays_shape[:-1], -1)),
+                depths.view((*rays_shape[:-1], -1)),
+                n_samples_total,
+            )
 
     results = []
     chunk = (

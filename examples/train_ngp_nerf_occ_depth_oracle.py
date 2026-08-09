@@ -1,7 +1,8 @@
 """
-NGP Occ NeRF trained with a frozen 2D depth/opacity sampling oracle (oracle_only).
+NGP Occ NeRF trained with a frozen 2D depth/opacity/frequency sampling oracle (oracle_only).
 
-Sampling uses only the baked maps: opacity skip + depth band [D-Δ, D+Δ].
+Sampling uses baked maps: opacity skip + depth band [D-Δ, D+Δ] with
+Δ = Δ0 * (1 + λ_F * F) from the Laplacian frequency map (FAGS-style).
 The OccGrid is filled occupied and never updated (no density-based skipping).
 
 Supports NeRF-Synthetic and Mip-NeRF 360. For baseline OccGrid training use
@@ -25,6 +26,12 @@ from datasets.utils import Rays
 from lpips import LPIPS
 from radiance_fields.ngp import NGPRadianceField
 
+from examples.oracle_frequency import (
+    depth_margin_from_frequency,
+    format_freq_sampling_stats,
+    render_step_size_from_frequency,
+    summarize_active_freq_sampling,
+)
 from examples.utils import (
     MIPNERF360_UNBOUNDED_SCENES,
     NERF_SYNTHETIC_SCENES,
@@ -52,7 +59,7 @@ def build_scene_config(scene: str, device: str):
             "test_dataset_kwargs": {"factor": 4},
             "grid_resolution": 128,
             "grid_nlvl": 4,
-            "render_step_size": 1e-3,
+            "render_step_size": 1e-3*10,
             "alpha_thre": 1e-2,
             "cone_angle": 0.004,
             "default_data_root": "data/360_v2",
@@ -79,7 +86,7 @@ def build_scene_config(scene: str, device: str):
         "test_dataset_kwargs": {},
         "grid_resolution": 128,
         "grid_nlvl": 1,
-        "render_step_size": 5e-3,
+        "render_step_size": 5e-3*10,
         "alpha_thre": 0.0,
         "cone_angle": 0.0,
         "default_data_root": "data/nerf_synthetic",
@@ -126,7 +133,32 @@ def main():
         "--depth_margin",
         type=float,
         default=None,
-        help="Override default margin (0.1 synthetic / 0.5 for 360)",
+        help="Base half-width Δ0 (default 0.1 synthetic / 0.5 for 360); "
+        "effective Δ = Δ0 * (1 + freq_margin_scale * F)",
+    )
+    parser.add_argument(
+        "--freq_margin_scale",
+        type=float,
+        default=1.0,
+        help="λ_F: extra depth-band width from frequency map F (0 = ignore F)",
+    )
+    parser.add_argument(
+        "--freq_step_scale",
+        type=float,
+        default=1.0,
+        help="LookCloser-style: shrink march step as δ/(1+λ_δ*F) (0 = constant step)",
+    )
+    parser.add_argument(
+        "--min_step_factor",
+        type=float,
+        default=0.25,
+        help="Lower clamp on per-ray step as fraction of base render_step_size",
+    )
+    parser.add_argument(
+        "--freq_step_bins",
+        type=int,
+        default=4,
+        help="Bins for per-ray step sizes (OccGrid API is scalar per call)",
     )
     parser.add_argument(
         "--opacity_threshold",
@@ -221,6 +253,10 @@ def main():
     oracle_train = torch.load(args.oracle_train_path, map_location=device)
     oracle_depths_train = oracle_train["depths"].to(device)
     oracle_opacities_train = oracle_train["opacities"].to(device)
+    if "frequencies" in oracle_train:
+        oracle_freqs_train = oracle_train["frequencies"].to(device)
+    else:
+        oracle_freqs_train = torch.zeros_like(oracle_depths_train)
     assert oracle_depths_train.shape[0] == len(train_dataset), (
         f"Oracle N={oracle_depths_train.shape[0]} vs train={len(train_dataset)}"
     )
@@ -228,6 +264,10 @@ def main():
     oracle_test = torch.load(args.oracle_test_path, map_location=device)
     oracle_depths_test = oracle_test["depths"].to(device)
     oracle_opacities_test = oracle_test["opacities"].to(device)
+    if "frequencies" in oracle_test:
+        oracle_freqs_test = oracle_test["frequencies"].to(device)
+    else:
+        oracle_freqs_test = torch.zeros_like(oracle_depths_test)
     assert oracle_depths_test.shape[0] == len(test_dataset), (
         f"Oracle N={oracle_depths_test.shape[0]} vs test={len(test_dataset)}"
     )
@@ -269,23 +309,27 @@ def main():
     lpips_norm_fn = lambda x: x[None, ...].permute(0, 3, 1, 2) * 2 - 1
     lpips_fn = lambda x, y: lpips_net(lpips_norm_fn(x), lpips_norm_fn(y)).mean()
 
-    def lookup_oracle(depths, opacities, image_ids, xs, ys):
+    def lookup_oracle(depths, opacities, frequencies, image_ids, xs, ys):
         flat_ids = image_ids.reshape(-1).long()
         flat_xs = xs.reshape(-1).long()
         flat_ys = ys.reshape(-1).long()
         return (
             depths[flat_ids, flat_ys, flat_xs],
             opacities[flat_ids, flat_ys, flat_xs],
+            frequencies[flat_ids, flat_ys, flat_xs],
         )
 
-    def oracle_bounds_from_maps(depth, opacity):
+    def oracle_bounds_from_maps(depth, opacity, frequency):
         active = opacity >= args.opacity_threshold
-        t_min = torch.clamp(depth - depth_margin, min=near_plane)
-        t_max = depth + depth_margin
+        margin = depth_margin_from_frequency(
+            depth_margin, frequency, args.freq_margin_scale
+        )
+        t_min = torch.clamp(depth - margin, min=near_plane)
+        t_max = depth + margin
         # Inactive rays: empty interval so sampling yields nothing if called.
         t_min = torch.where(active, t_min, torch.ones_like(t_min))
         t_max = torch.where(active, t_max, torch.zeros_like(t_max))
-        return t_min, t_max, active
+        return t_min, t_max, active, margin
 
     def render_with_oracle(
         radiance_field,
@@ -295,6 +339,7 @@ def main():
         *,
         depths_map,
         opacities_map,
+        frequencies_map,
         image_ids,
         xs,
         ys,
@@ -309,14 +354,26 @@ def main():
             alpha_thre=alpha_thre,
             # Oracle already restricts to [D-Δ, D+Δ]; skip density early-stop MLP.
             skip_sigma_fn=True,
+            num_step_bins=args.freq_step_bins,
         )
         if test_chunk_size is not None:
             render_kwargs["test_chunk_size"] = test_chunk_size
 
-        depth_q, opacity_q = lookup_oracle(
-            depths_map, opacities_map, image_ids, xs, ys
+        depth_q, opacity_q, freq_q = lookup_oracle(
+            depths_map, opacities_map, frequencies_map, image_ids, xs, ys
         )
-        t_min, t_max, active = oracle_bounds_from_maps(depth_q, opacity_q)
+        t_min, t_max, active, margin = oracle_bounds_from_maps(
+            depth_q, opacity_q, freq_q
+        )
+        step_sizes = render_step_size_from_frequency(
+            render_step_size,
+            freq_q,
+            freq_step_scale=args.freq_step_scale,
+            min_step_factor=args.min_step_factor,
+        )
+        freq_stats = summarize_active_freq_sampling(
+            freq_q, margin, step_sizes, active
+        )
         rays_shape = rays.origins.shape
 
         if len(rays_shape) == 3:  # test-time [H, W, 3]
@@ -326,6 +383,7 @@ def main():
                 rays,
                 t_min=t_min.view(rays_shape[0], rays_shape[1]),
                 t_max=t_max.view(rays_shape[0], rays_shape[1]),
+                render_step_sizes=step_sizes.view(rays_shape[0], rays_shape[1]),
                 **render_kwargs,
             )
             active_img = active.view(rays_shape[0], rays_shape[1], 1)
@@ -351,19 +409,25 @@ def main():
                 active_rays,
                 t_min=t_min[active_idx],
                 t_max=t_max[active_idx],
+                render_step_sizes=step_sizes[active_idx],
                 **render_kwargs,
             )
             rgb[active_idx] = rgb_a
             acc[active_idx] = acc_a
             depth[active_idx] = depth_a
-        return rgb, acc, depth, n_samples, n_active
+        return rgb, acc, depth, n_samples, n_active, freq_stats
 
     log_print(
         f"oracle_only scene={args.scene} is_360={cfg['is_360']} "
-        f"depth_margin={depth_margin} opacity_threshold={args.opacity_threshold} "
+        f"depth_margin={depth_margin} freq_margin_scale={args.freq_margin_scale} "
+        f"freq_step_scale={args.freq_step_scale} "
+        f"min_step_factor={args.min_step_factor} "
+        f"freq_step_bins={args.freq_step_bins} "
+        f"opacity_threshold={args.opacity_threshold} "
         f"target_sample_batch_size={target_sample_batch_size} "
         f"max_num_rays={max_num_rays} "
-        f"max_steps={max_steps} data_root={data_root} out_dir={out_dir}"
+        f"max_steps={max_steps} data_root={data_root} out_dir={out_dir} "
+        f"oracle_has_freq_train={bool((oracle_freqs_train > 0).any().item())}"
     )
 
     tic = time.time()
@@ -376,13 +440,21 @@ def main():
         rays = data["rays"]
         pixels = data["pixels"]
 
-        rgb, acc, depth, n_rendering_samples, n_active = render_with_oracle(
+        (
+            rgb,
+            acc,
+            depth,
+            n_rendering_samples,
+            n_active,
+            freq_stats,
+        ) = render_with_oracle(
             radiance_field,
             estimator,
             rays,
             render_bkgd,
             depths_map=oracle_depths_train,
             opacities_map=oracle_opacities_train,
+            frequencies_map=oracle_freqs_train,
             image_ids=data["image_ids"],
             xs=data["xs"],
             ys=data["ys"],
@@ -423,6 +495,9 @@ def main():
                 f"n_rendering_samples={n_rendering_samples:d} | "
                 f"num_rays={len(pixels):d} | n_active={n_active:d} | "
                 f"max_depth={depth.max():.3f} | "
+                f"{format_freq_sampling_stats(freq_stats)} | "
+                f"λΔ={args.freq_margin_scale:g} λδ={args.freq_step_scale:g} "
+                f"Δ0={depth_margin:g} δ0={render_step_size:g}"
             )
 
         if step > 0 and step % max_steps == 0:
@@ -436,6 +511,9 @@ def main():
                     "scene": args.scene,
                     "oracle_mode": "oracle_only",
                     "depth_margin": depth_margin,
+                    "freq_margin_scale": args.freq_margin_scale,
+                    "freq_step_scale": args.freq_step_scale,
+                    "min_step_factor": args.min_step_factor,
                     "opacity_threshold": args.opacity_threshold,
                     "radiance_field_state_dict": radiance_field.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -465,6 +543,7 @@ def main():
                         data["color_bkgd"],
                         depths_map=oracle_depths_test,
                         opacities_map=oracle_opacities_test,
+                        frequencies_map=oracle_freqs_test,
                         image_ids=data["image_ids"],
                         xs=data["xs"],
                         ys=data["ys"],

@@ -176,6 +176,16 @@ PYTHONPATH=. python examples/visualize_oracle_views.py \
 
 Outputs under `experiments/oracles/<scene>/...`: `depth/`, `opacity/`, `rgb/` (if `--model_path`), plus optional `*_360.gif`.
 
+## Frequency-adaptive sampling (optional)
+
+Baked \(F(u,v)\) can widen the depth band and shrink the march step. Details:
+
+- [`oracle_frequency_map.md`](oracle_frequency_map.md) — how \(F\) is built (Laplacian / FAGS-style)
+- [`oracle_frequency_depth_margin.md`](oracle_frequency_depth_margin.md) — \(\Delta=\Delta_0(1+\lambda_\Delta F)\)
+- [`oracle_frequency_step_size.md`](oracle_frequency_step_size.md) — \(\delta=\delta_0/(1+\lambda_\delta F)\)
+
+Disable both with `--freq_margin_scale 0 --freq_step_scale 0`. Train logs every 50 steps report `F_*`, `Δ_*`, `δ_*` on active rays.
+
 ## What to compare
 
-From `log.txt`: `n_rendering_samples`, `n_active`, `elapsed_time`, train PSNR, final `psnr_avg` / `lpips_avg`. Sweep `--depth_margin` if quality drops (try larger values on 360).
+From `log.txt`: `n_rendering_samples`, `n_active`, `elapsed_time`, train PSNR, final `psnr_avg` / `lpips_avg`, plus frequency stats (`F_mean`, `Δ_*`, `δ_*`). Sweep `--depth_margin` if quality drops (try larger values on 360).
