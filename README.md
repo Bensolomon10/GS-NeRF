@@ -4,6 +4,8 @@
 
 Built on [NerfAcc](https://github.com/nerfstudio-project/nerfacc) (`OccGridEstimator` + volumetric rendering).
 
+<img src="outputs/gs-nerf-diagram.png" alt="GS-NeRF diagram" width="100%" />
+
 ## Oracle trainers
 
 
