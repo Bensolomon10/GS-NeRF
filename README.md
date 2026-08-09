@@ -25,10 +25,10 @@ Oracle visualizations (RGB / depth / opacity / frequency) for **Lego** (syntheti
 
 <table align="center">
   <tr>
-    <td align="center" width="25%"><img src="experiments/outputs/lego/rgb_360.gif" width="100%" alt="Lego RGB" /></td>
-    <td align="center" width="25%"><img src="experiments/outputs/lego/depth_360.gif" width="100%" alt="Lego depth" /></td>
-    <td align="center" width="25%"><img src="experiments/outputs/lego/opacity_360.gif" width="100%" alt="Lego opacity" /></td>
-    <td align="center" width="25%"><img src="experiments/outputs/lego/frequency_360.gif" width="100%" alt="Lego frequency" /></td>
+    <td align="center" width="25%"><img src="outputs/lego/rgb_360.gif" width="100%" alt="Lego RGB" /></td>
+    <td align="center" width="25%"><img src="outputs/lego/depth_360.gif" width="100%" alt="Lego depth" /></td>
+    <td align="center" width="25%"><img src="outputs/lego/opacity_360.gif" width="100%" alt="Lego opacity" /></td>
+    <td align="center" width="25%"><img src="outputs/lego/frequency_360.gif" width="100%" alt="Lego frequency" /></td>
   </tr>
   <tr>
     <td align="center"><sub><b>RGB</b></sub></td>
@@ -42,10 +42,10 @@ Oracle visualizations (RGB / depth / opacity / frequency) for **Lego** (syntheti
 
 <table align="center">
   <tr>
-    <td align="center" width="25%"><img src="experiments/outputs/garden/rgb_360.gif" width="100%" alt="Garden RGB" /></td>
-    <td align="center" width="25%"><img src="experiments/outputs/garden/depth_360.gif" width="100%" alt="Garden depth" /></td>
-    <td align="center" width="25%"><img src="experiments/outputs/garden/opacity_360.gif" width="100%" alt="Garden opacity" /></td>
-    <td align="center" width="25%"><img src="experiments/outputs/garden/frequency_360.gif" width="100%" alt="Garden frequency" /></td>
+    <td align="center" width="25%"><img src="outputs/garden/rgb_360.gif" width="100%" alt="Garden RGB" /></td>
+    <td align="center" width="25%"><img src="outputs/garden/depth_360.gif" width="100%" alt="Garden depth" /></td>
+    <td align="center" width="25%"><img src="outputs/garden/opacity_360.gif" width="100%" alt="Garden opacity" /></td>
+    <td align="center" width="25%"><img src="outputs/garden/frequency_360.gif" width="100%" alt="Garden frequency" /></td>
   </tr>
   <tr>
     <td align="center"><sub><b>RGB</b></sub></td>
